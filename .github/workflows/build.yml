@@ -1,0 +1,200 @@
+name: Build Xiaomi Rock kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_susfs:
+        description: Apply SUSFS patch (butuh manual hook SukiSU di source + branch builtin)
+        required: true
+        type: boolean
+        default: false
+      sukisu_branch:
+        description: Branch SukiSU-Ultra (pakai main jika belum ada manual hook)
+        required: true
+        type: choice
+        options:
+          - main
+          - builtin
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rock-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Rock arm64 Image.gz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GIT_TERMINAL_PROMPT: '0'
+      AOSP_CLANG_VER: clang-r547379
+      ARCH: arm64
+      LLVM: '1'
+      LLVM_IAS: '1'
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+      KCFLAGS: >-
+        -D__ANDROID_COMMON_KERNEL__
+        -Wno-error=bitwise-instead-of-logical
+        -Wno-error=strict-prototypes
+        -Wno-error=unused-but-set-variable
+        -Wno-error=cast-function-type-strict
+        -Wno-error=single-bit-bitfield-constant-conversion
+        -Wno-error=deprecated-non-prototype
+        -Wno-error=implicit-int
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio curl flex git kmod libelf-dev libssl-dev \
+            lz4 python3 python-is-python3 dwarves device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            perl patch xz-utils zstd
+
+      - name: Cache AOSP Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ~/aosp-clang
+          key: aosp-clang-${{ env.AOSP_CLANG_VER }}
+
+      - name: Download AOSP Clang
+        if: ${{ steps.cache-clang.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/aosp-clang"
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/${AOSP_CLANG_VER}.tar.gz" \
+            -o "$RUNNER_TEMP/${AOSP_CLANG_VER}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/${AOSP_CLANG_VER}.tar.gz" -C "$HOME/aosp-clang"
+          rm -f "$RUNNER_TEMP/${AOSP_CLANG_VER}.tar.gz"
+
+      - name: Setup AOSP Clang PATH
+        run: |
+          set -euo pipefail
+          test -x "$HOME/aosp-clang/bin/clang"
+          test -x "$HOME/aosp-clang/bin/ld.lld"
+          echo "$HOME/aosp-clang/bin" >> "$GITHUB_PATH"
+          "$HOME/aosp-clang/bin/clang" --version
+          "$HOME/aosp-clang/bin/ld.lld" --version
+
+      - name: Validate SukiSU and SUSFS combination
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ inputs.sukisu_branch }}" != "builtin" ]; then
+            echo "::error::SUSFS membutuhkan sukisu_branch=builtin (dan manual hooks SukiSU di kernel source)."
+            exit 1
+          fi
+
+      - name: Add SukiSU
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh \
+            -o "$RUNNER_TEMP/sukisu-setup.sh"
+          bash "$RUNNER_TEMP/sukisu-setup.sh" "${{ inputs.sukisu_branch }}"
+          test -d KernelSU/kernel
+          test -e drivers/kernelsu/Kconfig
+
+      - name: Apply SUSFS
+        if: ${{ inputs.enable_susfs == true }}
+        run: |
+          set -euo pipefail
+
+          SUSFS_DIR="$RUNNER_TEMP/susfs4ksu"
+          git clone --depth=1 --branch gki-android12-5.10 \
+            https://gitlab.com/simonpunk/susfs4ksu.git "$SUSFS_DIR"
+
+          PATCH_FILE="$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch"
+          test -f "$PATCH_FILE"
+          test -d "$SUSFS_DIR/kernel_patches/fs"
+          test -d "$SUSFS_DIR/kernel_patches/include/linux"
+
+          cp -a "$SUSFS_DIR/kernel_patches/fs/." fs/
+          cp -a "$SUSFS_DIR/kernel_patches/include/linux/." include/linux/
+
+          patch --batch --forward --dry-run -p1 < "$PATCH_FILE"
+          patch --batch --forward -p1 < "$PATCH_FILE"
+
+      - name: Configure kernel
+        env:
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
+          SUKISU_BRANCH: ${{ inputs.sukisu_branch }}
+        run: |
+          set -euo pipefail
+
+          test -f arch/arm64/configs/mgk_64_k510_defconfig
+          test -f arch/arm64/configs/rock.fragment
+          test -f scripts/kconfig/merge_config.sh
+          test -f scripts/config
+
+          mkdir -p out
+
+          make O=out mgk_64_k510_defconfig
+
+          cp out/.config out/.config.base
+          scripts/kconfig/merge_config.sh -m -O out \
+            out/.config.base \
+            arch/arm64/configs/rock.fragment
+          rm -f out/.config.base
+
+          if [ "$SUKISU_BRANCH" = "main" ]; then
+            bash scripts/config --file out/.config --enable KPROBES
+            bash scripts/config --file out/.config --enable EXT4_FS
+          fi
+
+          bash scripts/config --file out/.config --enable KSU
+
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            for option in \
+              KSU_SUSFS \
+              KSU_SUSFS_SUS_PATH \
+              KSU_SUSFS_SUS_MOUNT \
+              KSU_SUSFS_SUS_KSTAT \
+              KSU_SUSFS_SPOOF_UNAME \
+              KSU_SUSFS_ENABLE_LOG \
+              KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              KSU_SUSFS_OPEN_REDIRECT \
+              KSU_SUSFS_SUS_MAP; do
+              bash scripts/config --file out/.config --enable "$option"
+            done
+          fi
+
+          make O=out olddefconfig
+
+          echo "=== KSU Config Summary ==="
+          grep '^CONFIG_KSU' out/.config || true
+
+          grep -q '^CONFIG_KSU=y' out/.config
+
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+          fi
+
+      - name: Build Image.gz
+        run: |
+          set -euo pipefail
+
+          make -j"$(nproc)" O=out Image.gz
+
+          test -s out/arch/arm64/boot/Image.gz
+
+      - name: Upload Image.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: rock-Image-${{ github.sha }}
+          if-no-files-found: error
+          path: out/arch/arm64/boot/Image.gz
