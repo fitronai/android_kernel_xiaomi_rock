@@ -3,19 +3,35 @@ name: Build Xiaomi Rock kernel
 on:
   workflow_dispatch:
     inputs:
-      enable_susfs:
-        description: Apply SUSFS patch (butuh manual hook SukiSU di source + branch builtin)
-        required: true
-        type: boolean
-        default: false
       sukisu_branch:
-        description: Branch SukiSU-Ultra (pakai main jika belum ada manual hook)
+        description: Branch SukiSU-Ultra (main = kprobes, builtin = butuh manual hooks, none = tanpa KSU)
         required: true
         type: choice
         options:
           - main
           - builtin
+          - none
         default: main
+      use_kpm:
+        description: Aktifkan KPM (Kernel Patch Module) + patch_linux
+        required: true
+        type: boolean
+        default: false
+      enable_susfs:
+        description: Apply SUSFS patch (wajib sukisu_branch = builtin)
+        required: true
+        type: boolean
+        default: false
+      apply_syscall_hooks:
+        description: Apply SukiSU_patch hooks/syscall_hooks.patch (opsional untuk builtin)
+        required: true
+        type: boolean
+        default: false
+      custom_version:
+        description: Override CONFIG_LOCALVERSION (kosongkan untuk default -UndergroundKernel)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -90,15 +106,24 @@ jobs:
           "$HOME/aosp-clang/bin/clang" --version
           "$HOME/aosp-clang/bin/ld.lld" --version
 
-      - name: Validate SukiSU and SUSFS combination
+      - name: Validate workflow inputs
         run: |
           set -euo pipefail
           if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ inputs.sukisu_branch }}" != "builtin" ]; then
-            echo "::error::SUSFS membutuhkan sukisu_branch=builtin (dan manual hooks SukiSU di kernel source)."
+            echo "::error::SUSFS membutuhkan sukisu_branch=builtin."
+            exit 1
+          fi
+          if [ "${{ inputs.apply_syscall_hooks }}" = "true" ] && [ "${{ inputs.sukisu_branch }}" != "builtin" ]; then
+            echo "::error::apply_syscall_hooks hanya untuk sukisu_branch=builtin."
+            exit 1
+          fi
+          if [ "${{ inputs.use_kpm }}" = "true" ] && [ "${{ inputs.sukisu_branch }}" = "none" ]; then
+            echo "::error::KPM tidak dapat diaktifkan jika sukisu_branch=none."
             exit 1
           fi
 
       - name: Add SukiSU
+        if: ${{ inputs.sukisu_branch != 'none' }}
         run: |
           set -euo pipefail
           curl --fail --location --retry 5 --retry-all-errors \
@@ -128,10 +153,23 @@ jobs:
           patch --batch --forward --dry-run -p1 < "$PATCH_FILE"
           patch --batch --forward -p1 < "$PATCH_FILE"
 
+      - name: Apply SukiSU Syscall Hooks
+        if: ${{ inputs.apply_syscall_hooks == true }}
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/hooks/syscall_hooks.patch \
+            -o "$RUNNER_TEMP/syscall_hooks.patch"
+
+          patch --batch --forward --dry-run -p1 < "$RUNNER_TEMP/syscall_hooks.patch"
+          patch --batch --forward -p1 < "$RUNNER_TEMP/syscall_hooks.patch"
+
       - name: Configure kernel
         env:
-          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
           SUKISU_BRANCH: ${{ inputs.sukisu_branch }}
+          USE_KPM: ${{ inputs.use_kpm }}
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
+          CUSTOM_VERSION: ${{ inputs.custom_version }}
         run: |
           set -euo pipefail
 
@@ -150,35 +188,55 @@ jobs:
             arch/arm64/configs/rock.fragment
           rm -f out/.config.base
 
-          if [ "$SUKISU_BRANCH" = "main" ]; then
-            bash scripts/config --file out/.config --enable KPROBES
-            bash scripts/config --file out/.config --enable EXT4_FS
+          if [ -n "$CUSTOM_VERSION" ]; then
+            bash scripts/config --file out/.config --set-str LOCALVERSION "$CUSTOM_VERSION"
           fi
 
-          bash scripts/config --file out/.config --enable KSU
+          if [ "$SUKISU_BRANCH" != "none" ]; then
+            if [ "$SUKISU_BRANCH" = "main" ]; then
+              bash scripts/config --file out/.config --enable KPROBES
+              bash scripts/config --file out/.config --enable EXT4_FS
+            fi
 
-          if [ "$ENABLE_SUSFS" = "true" ]; then
-            for option in \
-              KSU_SUSFS \
-              KSU_SUSFS_SUS_PATH \
-              KSU_SUSFS_SUS_MOUNT \
-              KSU_SUSFS_SUS_KSTAT \
-              KSU_SUSFS_SPOOF_UNAME \
-              KSU_SUSFS_ENABLE_LOG \
-              KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-              KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-              KSU_SUSFS_OPEN_REDIRECT \
-              KSU_SUSFS_SUS_MAP; do
-              bash scripts/config --file out/.config --enable "$option"
-            done
+            bash scripts/config --file out/.config --enable KSU
+
+            if [ "$USE_KPM" = "true" ]; then
+              bash scripts/config --file out/.config --enable KALLSYMS
+              bash scripts/config --file out/.config --enable KALLSYMS_ALL
+              bash scripts/config --file out/.config --enable KPM
+            fi
+
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              for option in \
+                KSU_SUSFS \
+                KSU_SUSFS_SUS_PATH \
+                KSU_SUSFS_SUS_MOUNT \
+                KSU_SUSFS_SUS_KSTAT \
+                KSU_SUSFS_SPOOF_UNAME \
+                KSU_SUSFS_ENABLE_LOG \
+                KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                KSU_SUSFS_OPEN_REDIRECT \
+                KSU_SUSFS_SUS_MAP; do
+                bash scripts/config --file out/.config --enable "$option"
+              done
+            fi
           fi
 
           make O=out olddefconfig
 
-          echo "=== KSU Config Summary ==="
-          grep '^CONFIG_KSU' out/.config || true
+          echo "=== Kernel & KSU Config Summary ==="
+          grep -E '^CONFIG_(LOCALVERSION|KSU|KPM|KALLSYMS|LTO|CFI)' out/.config || true
 
-          grep -q '^CONFIG_KSU=y' out/.config
+          if [ "$SUKISU_BRANCH" != "none" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config
+          fi
+
+          if [ "$USE_KPM" = "true" ]; then
+            grep -q '^CONFIG_KPM=y' out/.config
+            grep -q '^CONFIG_KALLSYMS=y' out/.config
+            grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config
+          fi
 
           if [ "$ENABLE_SUSFS" = "true" ]; then
             grep -q '^CONFIG_KSU_SUSFS=y' out/.config
@@ -190,7 +248,25 @@ jobs:
 
           make -j"$(nproc)" O=out Image.gz
 
+          test -s out/arch/arm64/boot/Image
           test -s out/arch/arm64/boot/Image.gz
+
+      - name: Patch Image for KPM
+        if: ${{ inputs.use_kpm == true }}
+        run: |
+          set -euo pipefail
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/kpm/patch_linux \
+            -o "$RUNNER_TEMP/patch_linux"
+          chmod +x "$RUNNER_TEMP/patch_linux"
+
+          cd out/arch/arm64/boot
+          "$RUNNER_TEMP/patch_linux"
+          test -s oImage
+          mv -f oImage Image
+          gzip -n -f -9 -c Image > Image.gz
+          test -s Image.gz
 
       - name: Upload Image.gz
         uses: actions/upload-artifact@v4
